@@ -21,7 +21,7 @@ class CaptureConfig:
     SILENCE_WARN_SECONDS: int = 5
 
     DEBUG_SAVE_WAV: bool = True
-    DEBUG_SAVE_DIR: str = "realtime_translator/captured_speech"
+    DEBUG_SAVE_DIR: str = "captured_speech"
 
     RESAMPLE_QUALITY: str = "HQ"
     MONO_STRATEGY: str = "average_safe"
