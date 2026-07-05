@@ -25,6 +25,7 @@ except ImportError:
 @dataclass
 class BenchmarkStats:
     dropped_segments: int = 0
+    dropped_wav_jobs: int = 0
 
 
 @dataclass
@@ -82,11 +83,16 @@ class Pipeline:
             self.log_queue.put(PipelineEvent(type=event_type, data=data))
 
     def run(self, stop_event: threading.Event):
-        """Block until stop_event is set (console mode)."""
+        """Block until stop_event is set (console mode).
+
+        Consumer runs in daemon thread from _start_threads().
+        run() only waits — guaranteed exactly 1 consumer loop.
+        """
         self.stop_event = stop_event
         self._initialize()
         self._start_threads()
-        self._consumer_loop(stop_event)
+        stop_event.wait()
+        self.segment_queue.put(None)
         self._cleanup()
 
     def start_async(self):
@@ -217,7 +223,11 @@ class Pipeline:
                 filename = os.path.join(
                     self.config.DEBUG_SAVE_DIR, f"chunk_{self.chunk_index:03d}.wav"
                 )
-                self.wav_queue.put_nowait((filename, segment, sr))
+                try:
+                    self.wav_queue.put_nowait((filename, segment, sr))
+                except queue.Full:
+                    print(f"[WARN] WAV queue full — dropped {filename}")
+                    self.stats.dropped_wav_jobs += 1
 
             if self.segment_callback:
                 self.segment_callback(segment, speech_ms, total_ms)
@@ -259,5 +269,6 @@ class Pipeline:
             "state": self.dsp_vad.state if self.dsp_vad else "N/A",
             "dropped_raw_chunks": self.capture.stats_dropped_raw,
             "dropped_segments": self.stats.dropped_segments,
+            "dropped_wav_jobs": self.stats.dropped_wav_jobs,
             "pa_input_overflows": self.capture.stats_overflow,
         }

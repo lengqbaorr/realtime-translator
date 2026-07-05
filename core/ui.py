@@ -37,12 +37,15 @@ class CaptureUI:
 
     WINDOW_TITLE = "Real-Time Audio Capture"
     WINDOW_W = 420
-    WINDOW_H = 480
+    WINDOW_H = 680
 
-    def __init__(self, config: CaptureConfig | None = None):
+    def __init__(self, config: CaptureConfig | None = None,
+                 segment_callback=None):
         self.config = config or CaptureConfig()
         self.log_queue: queue.Queue = queue.Queue()
         self.pipeline = Pipeline(self.config, log_queue=self.log_queue)
+        if segment_callback:
+            self.pipeline.set_segment_callback(segment_callback)
 
         self.root = tk.Tk()
         self.root.title(self.WINDOW_TITLE)
@@ -100,6 +103,18 @@ class CaptureUI:
             selectmode=tk.SINGLE, activestyle=tk.NONE,
         )
         self.log_list.pack(fill=tk.BOTH, expand=True, pady=(2, 0))
+
+        # ── ASR text area ──
+        asr_frame = ttk.Frame(self.root, padding=(8, 0, 8, 4))
+        asr_frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(asr_frame, text="ASR Output:", font=("Segoe UI", 8)).pack(anchor=tk.W)
+
+        self.asr_list = tk.Listbox(
+            asr_frame, height=6, font=("Consolas", 9),
+            selectmode=tk.SINGLE, activestyle=tk.NONE,
+        )
+        self.asr_list.pack(fill=tk.BOTH, expand=True, pady=(2, 0))
 
         # ── Bottom frame: stats + hotkeys ──
         bottom = ttk.Frame(self.root, padding=(8, 4, 8, 8))
@@ -201,6 +216,13 @@ class CaptureUI:
                     self.device_label.config(text=d.get("device", "?"))
                 elif status == "stopped":
                     pass
+
+            elif t == "asr_text":
+                text = d.get("text", "").strip()
+                if text:
+                    self.asr_list.insert(0, text)
+                    while self.asr_list.size() > 50:
+                        self.asr_list.delete(tk.END)
 
             elif t == "error":
                 self.log_list.insert(0, f"[ERR] {d.get('message', '')}")
