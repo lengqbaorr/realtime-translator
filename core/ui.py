@@ -1,6 +1,4 @@
 import queue
-import threading
-import time
 from datetime import datetime
 
 import tkinter as tk
@@ -39,13 +37,11 @@ class CaptureUI:
     WINDOW_W = 420
     WINDOW_H = 680
 
-    def __init__(self, config: CaptureConfig | None = None,
-                 segment_callback=None):
+    def __init__(self, config: CaptureConfig | None = None):
         self.config = config or CaptureConfig()
         self.log_queue: queue.Queue = queue.Queue()
         self.pipeline = Pipeline(self.config, log_queue=self.log_queue)
-        if segment_callback:
-            self.pipeline.set_segment_callback(segment_callback)
+        self._partial_row_active = False
 
         self.root = tk.Tk()
         self.root.title(self.WINDOW_TITLE)
@@ -219,10 +215,21 @@ class CaptureUI:
 
             elif t == "asr_text":
                 text = d.get("text", "").strip()
+                is_final = d.get("is_final", False)
                 if text:
-                    self.asr_list.insert(0, text)
+                    if is_final:
+                        if self._partial_row_active and self.asr_list.size() > 0:
+                            self.asr_list.delete(tk.END)
+                        self.asr_list.insert(tk.END, text)
+                        self._partial_row_active = False
+                    else:
+                        if self._partial_row_active and self.asr_list.size() > 0:
+                            self.asr_list.delete(tk.END)
+                        self.asr_list.insert(tk.END, text + " ...")
+                        self._partial_row_active = True
                     while self.asr_list.size() > 50:
-                        self.asr_list.delete(tk.END)
+                        self.asr_list.delete(0)
+                    self.asr_list.see(tk.END)
 
             elif t == "error":
                 self.log_list.insert(0, f"[ERR] {d.get('message', '')}")

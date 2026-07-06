@@ -7,10 +7,12 @@ class CaptureConfig:
     CHUNK_SIZE: int = 512
 
     VAD_THRESHOLD: float = 0.5
-    PRE_SPEECH_PAD_MS: int = 300
+    PRE_SPEECH_PAD_MS: int = 1200
     POST_SPEECH_PAD_MS: int = 300
     MIN_SPEECH_DURATION_MS: int = 300
-    VAD_MIN_SILENCE_MS: int = 1000
+    VAD_MIN_SILENCE_MS: int = 600
+    SOFT_COMMA_PAUSE_MS: int = 500
+    SOFT_SENTENCE_PAUSE_MS: int = 700
 
     RAW_QUEUE_MAXSIZE: int = 30
     SEGMENT_QUEUE_MAXSIZE: int = 10
@@ -51,13 +53,24 @@ class CaptureConfig:
 
 @dataclass
 class AsrConfig:
-    MODEL_SIZE: str = "base.en"
-    DEVICE: str = "cpu"
-    COMPUTE_TYPE: str = "int8"
-    LANGUAGE: str = "en"
-    BEAM_SIZE: int = 5
-    CONDITION_ON_PREVIOUS_TEXT: bool = True
-    VAD_FILTER: bool = False
-    WORD_TIMESTAMPS: bool = False
-    ASR_QUEUE_MAXSIZE: int = 10
-    LOW_CONFIDENCE_AVG_LOGPROB: float = -2.0
+    encoder: str = "models/zipformer-en/encoder-epoch-99-avg-1.int8.onnx"
+    decoder: str = "models/zipformer-en/decoder-epoch-99-avg-1.int8.onnx"
+    joiner: str = "models/zipformer-en/joiner-epoch-99-avg-1.int8.onnx"
+    tokens: str = "models/zipformer-en/tokens.txt"
+    num_threads: int = 2
+    partial_update_interval_ms: int = 800
+    asr_queue_maxsize: int = 60
+    result_queue_maxsize: int = 100
+    warmup_silence_ms: int = 1000
+    initial_stream_context_ms: int = 500
+    endpoint_rule1_min_trailing_silence: float = 60.0
+    endpoint_rule2_min_trailing_silence: float = 1.6
+    endpoint_rule3_min_utterance_length: float = 120.0
+    min_endpoint_duration_ms: int = 2500
+    min_endpoint_words: int = 3
+    soft_boundary_commit_delay_ms: int = 600
+    soft_boundary_retry_interval_ms: int = 150
+    soft_boundary_max_wait_ms: int = 1800
+    min_soft_boundary_words: int = 3
+    debug_console_logs: bool = True
+    debug_stream_log_interval_s: float = 2.0

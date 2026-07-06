@@ -9,23 +9,12 @@ from core.config import CaptureConfig
 
 
 class DspVad:
-    """DSP processing + VAD state machine.
+    """Audio resampling + VAD state tracking for UI meter.
 
-    State machine: IDLE → SPEECH → PENDING_FINALIZE → IDLE
-
-    PENDING_FINALIZE is a hangover state: when VAD signals 'end',
-    we don't finalize immediately. Instead we keep appending audio
-    to the segment buffer and wait VAD_MIN_SILENCE_MS of continuous
-    silence. If speech resumes within that window, we return to SPEECH
-    seamlessly (buffer continuity guaranteed). This prevents premature
-    segmentation during natural pauses (breath, hesitation, 300–800ms).
-
-    Single source of truth for silence threshold: VAD_MIN_SILENCE_MS.
-    VADIterator's native min_silence_duration_ms=0 (per-frame detection)
-    — all timing is handled by PENDING_FINALIZE's hangover timer.
-
-    reset_states() is called only at the moment of finalizing a segment,
-    never independently.
+    All resampled chunks are forwarded to ASR continuously via
+    speech_chunk_callback. VAD is used only for UI state display,
+    NOT for segmentation. Sherpa-ONNX endpoint detection handles
+    utterance finalization.
     """
 
     def __init__(
@@ -40,7 +29,8 @@ class DspVad:
         self.device_rate = device_rate
         self.device_channels = device_channels
 
-        self.segment_callback = None
+        self.speech_chunk_callback = None
+        self.soft_boundary_callback = None
 
         self.vad_model = None
         self.vad_iterator = None
@@ -51,35 +41,18 @@ class DspVad:
         self.accum_pos = 0
 
         self.state = "IDLE"
-        self.pre_buffer = []
-        self.pre_buffer_samples = 0
-        self.pre_pad_samples = config.PRE_SPEECH_PAD_SAMPLES
-
-        self.segment_buf = np.zeros(config.MAX_SEGMENT_SAMPLES, dtype=np.float32)
-        self.write_pos = 0
-        self.speech_only_start = 0
-
-        self.silence_since_last = 0.0
-        self.hangover_timer = 0.0
-
-        chunk_dur_ms = config.CHUNK_SIZE * 1000 / config.TARGET_SAMPLE_RATE
-
-        self.chunk_index = 0
-        self.chunk_count = 0
         self.speech_duration = 0.0
+        self._pending_silence_ms = 0.0
+        self._pending_boundary_emitted = False
+        self._forwarded_chunks = 0
 
-    def set_segment_callback(self, callback):
-        """Set callback for completed segments (Phase 2 hook)."""
-        self.segment_callback = callback
+    def set_speech_chunk_callback(self, callback):
+        self.speech_chunk_callback = callback
+
+    def set_soft_boundary_callback(self, callback):
+        self.soft_boundary_callback = callback
 
     def initialize(self):
-        """Load VAD model and create resampler.
-
-        Called before capture starts to avoid delay on first audio.
-        VADIterator's native min_silence_duration_ms=0: all silence
-        timing is handled by the PENDING_FINALIZE state machine,
-        not by VAD's internal counter.
-        """
         self.vad_model = load_silero_vad()
         self.vad_iterator = VADIterator(
             self.vad_model,
@@ -96,13 +69,7 @@ class DspVad:
             quality=self.config.RESAMPLE_QUALITY,
         )
 
-    def process_chunk(self, raw_bytes: bytes) -> tuple | None:
-        """Process one raw audio chunk.
-
-        Returns:
-            (segment_array, speech_ms, total_ms) if a segment completes,
-            None otherwise.
-        """
+    def process_chunk(self, raw_bytes: bytes):
         raw = np.frombuffer(raw_bytes, dtype=np.int16)
 
         if self.device_channels > 1:
@@ -143,113 +110,69 @@ class DspVad:
             self.accum_buf[:remaining] = self.accum_buf[self.config.CHUNK_SIZE:self.accum_pos]
         self.accum_pos = remaining
 
-        self._update_pre_buffer(chunk_16k)
+        self._update_vad_state(chunk_16k)
 
+        if self.speech_chunk_callback:
+            self.speech_chunk_callback(chunk_16k)
+            self._forwarded_chunks += 1
+            if self._forwarded_chunks == 1:
+                print(
+                    "[DSP] first 16k chunk forwarded to ASR: "
+                    f"{len(chunk_16k)} samples",
+                    flush=True,
+                )
+
+        return None
+
+    def _update_vad_state(self, chunk_16k: np.ndarray):
         speech_dict = self.vad_iterator(chunk_16k, return_seconds=True)
         has_start = speech_dict is not None and "start" in speech_dict
         has_end = speech_dict is not None and "end" in speech_dict
-
-        result = None
         chunk_dur_ms = len(chunk_16k) * 1000 / self.config.TARGET_SAMPLE_RATE
 
         if self.state == "IDLE":
-            self.silence_since_last += chunk_dur_ms
-
             if has_start:
-                self.silence_since_last = 0.0
                 self.state = "SPEECH"
-                self._start_segment()
-                self._append_to_segment(chunk_16k)
-                self.speech_duration = len(chunk_16k) / self.config.TARGET_SAMPLE_RATE
-                print(f"[SEGMENT] SPEECH start")
-
+                self.speech_duration = chunk_dur_ms / 1000
+                print("[VAD] state IDLE -> SPEECH", flush=True)
         elif self.state == "SPEECH":
-            self._append_to_segment(chunk_16k)
-            self.speech_duration += len(chunk_16k) / self.config.TARGET_SAMPLE_RATE
-
+            self.speech_duration += chunk_dur_ms / 1000
             if has_end:
                 self.state = "PENDING_FINALIZE"
-                self.hangover_timer = 0.0
-                print(f"[SEGMENT] PENDING_FINALIZE enter at {self.speech_duration:.2f}s")
-
+                self._pending_silence_ms = 0.0
+                self._pending_boundary_emitted = False
+                print("[VAD] state SPEECH -> PENDING_FINALIZE", flush=True)
         elif self.state == "PENDING_FINALIZE":
-            self._append_to_segment(chunk_16k)
-            self.hangover_timer += chunk_dur_ms
-
             if has_start:
-                print(f"[SEGMENT] SPEECH resume after {self.hangover_timer:.0f}ms hangover")
+                if (not self._pending_boundary_emitted
+                        and self._pending_silence_ms >= self.config.SOFT_COMMA_PAUSE_MS):
+                    boundary_type = (
+                        "sentence"
+                        if self._pending_silence_ms >= self.config.SOFT_SENTENCE_PAUSE_MS
+                        else "comma"
+                    )
+                    self._emit_soft_boundary(boundary_type, self._pending_silence_ms)
                 self.state = "SPEECH"
-                self.speech_duration += len(chunk_16k) / self.config.TARGET_SAMPLE_RATE
+                self.speech_duration += chunk_dur_ms / 1000
+                self._pending_silence_ms = 0.0
+                self._pending_boundary_emitted = False
+                print("[VAD] state PENDING_FINALIZE -> SPEECH", flush=True)
+            else:
+                self._pending_silence_ms += chunk_dur_ms
+                if (not self._pending_boundary_emitted
+                        and self._pending_silence_ms >= self.config.SOFT_SENTENCE_PAUSE_MS):
+                    self._emit_soft_boundary("sentence", self._pending_silence_ms)
+                    self._pending_boundary_emitted = True
+                if self._pending_silence_ms > 3000:
+                    self.state = "IDLE"
+                    self.speech_duration = 0.0
+                    print("[VAD] state PENDING_FINALIZE -> IDLE", flush=True)
 
-            elif self.hangover_timer >= self.config.VAD_MIN_SILENCE_MS:
-                result = self._finalize_segment()
-                if result is not None:
-                    print(f"[SEGMENT] finalize: {result[2]:.0f}ms total, "
-                          f"{result[1]:.0f}ms speech, {self.chunk_index} chunks")
-                self.state = "IDLE"
-
-        return result
-
-    def _update_pre_buffer(self, chunk: np.ndarray):
-        """Maintain sample-accurate ring buffer for pre-speech padding.
-
-        Preserves at most PRE_SPEECH_PAD_SAMPLES of recent audio.
-        """
-        self.pre_buffer.append(chunk)
-        self.pre_buffer_samples += len(chunk)
-        while self.pre_buffer_samples > self.pre_pad_samples:
-            oldest = self.pre_buffer.pop(0)
-            self.pre_buffer_samples -= len(oldest)
-
-    def _start_segment(self):
-        """Copy pre-buffer content into the pre-allocated segment buffer.
-
-        Marks speech_only_start so that actual speech duration
-        can be tracked independently of padding.
-        """
-        self.write_pos = 0
-        for chunk in self.pre_buffer:
-            n = len(chunk)
-            end = self.write_pos + n
-            if end > self.config.MAX_SEGMENT_SAMPLES:
-                break
-            self.segment_buf[self.write_pos:end] = chunk
-            self.write_pos = end
-        self.speech_only_start = self.write_pos
-
-    def _append_to_segment(self, chunk: np.ndarray):
-        """Append resampled chunk to the pre-allocated buffer.
-
-        Called from SPEECH and PENDING_FINALIZE — no sample is ever
-        dropped during state transitions.
-        """
-        n = len(chunk)
-        end = self.write_pos + n
-        if end > self.config.MAX_SEGMENT_SAMPLES:
+    def _emit_soft_boundary(self, boundary_type: str, pause_ms: float):
+        if not self.soft_boundary_callback:
             return
-        self.segment_buf[self.write_pos:end] = chunk
-        self.write_pos = end
-
-    def _finalize_segment(self) -> tuple | None:
-        """Finalize and emit the accumulated segment.
-
-        Called when PENDING_FINALIZE hangover expires.
-        Resets VAD states at the same time — single reset point.
-        Emit only if speech_only_samples >= MIN_SPEECH_DURATION_SAMPLES.
-        Returns (segment_array, speech_ms, total_ms) or None.
-        """
-        speech_only_samples = self.write_pos - self.speech_only_start
-
-        if speech_only_samples < self.config.MIN_SPEECH_DURATION_SAMPLES:
-            self.write_pos = 0
-            self.vad_iterator.reset_states()
-            return None
-
-        segment = self.segment_buf[:self.write_pos].copy()
-        total_ms = self.write_pos * 1000 / self.config.TARGET_SAMPLE_RATE
-        speech_ms = speech_only_samples * 1000 / self.config.TARGET_SAMPLE_RATE
-        self.write_pos = 0
-
-        self.chunk_index += 1
-        self.vad_iterator.reset_states()
-        return (segment, speech_ms, total_ms)
+        print(
+            f"[VAD] soft boundary {boundary_type}: pause={pause_ms:.0f}ms",
+            flush=True,
+        )
+        self.soft_boundary_callback(boundary_type, pause_ms)
